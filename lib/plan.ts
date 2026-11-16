@@ -13,12 +13,27 @@ const RANGES: Record<string, [number, number]> = {
 const DEFAULT_RANGE: [number, number] = [4, 16];
 const PRIOR_DESIGNATED = 0.1;
 const PRIOR_OUTAGE = 0.1;
+const DESIGNATED_EXACT = (process.env.AGG_DES ?? '1') === '1';
 
 export type Outcome = 'ok' | 'sched';
 
 export class Risk {
   history = new Map<string, Outcome[]>();
   outageSeen = false;
+  providerCount = 10;
+
+  // Exactly one provider refuses its call 2 by design: a provider whose call 2 passed is not it, and a
+  // refusal seen at some call 2 most likely was it.
+  designatedPrior(provider: string): number {
+    let ruledOut = 0;
+    let suspect = false;
+    for (const [id, h] of this.history) {
+      if (h.length >= 2 && h[1] === 'ok') ruledOut += 1;
+      if (id !== provider && h.length >= 2 && h[1] === 'sched') suspect = true;
+    }
+    if (suspect) return 0.02;
+    return 1 / Math.max(1, this.providerCount - ruledOut);
+  }
 
   record(provider: string, outcome: Outcome): void {
     const h = this.history.get(provider) ?? [];
@@ -38,6 +53,7 @@ export class Risk {
     const bad = new Array<number>(n).fill(0);
     const [lo, hi] = RANGES[provider] ?? DEFAULT_RANGE;
     const pOut = this.outageSeen ? 0 : PRIOR_OUTAGE;
+    const pDes = DESIGNATED_EXACT ? this.designatedPrior(provider) : PRIOR_DESIGNATED;
     let total = 0;
     for (let B = lo; B <= hi; B++) {
       const span: number[] = [];
@@ -53,7 +69,7 @@ export class Risk {
         for (const designated of [false, true]) {
           let fails = sets[s];
           if (designated && !fails.includes(2)) fails = fails.length === 1 ? [2] : [2, fails[1]];
-          const wd = designated ? PRIOR_DESIGNATED : 1 - PRIOR_DESIGNATED;
+          const wd = designated ? pDes : 1 - pDes;
           const outs: [number | null, number][] = [[null, 1 - pOut]];
           if (pOut > 0) for (const u of span) outs.push([u, pOut / span.length]);
           for (const [u, wu] of outs) {

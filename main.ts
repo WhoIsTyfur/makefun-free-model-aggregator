@@ -27,6 +27,7 @@ async function buildCatalog(): Promise<CatalogEntry[]> {
 const dead = new Set<string>();
 let served = 0;
 const risk = new Risk();
+risk.providerCount = Math.max(1, brief.providers.length);
 const LAMBDA = Number(process.env.AGG_LAMBDA ?? '0.0003');
 let lossSoFar = 0;
 const bound = brief.manifest.reduce((s, m) => s + (m.weight ?? 1) * (brief.best.get(m.id) ?? 0), 0);
