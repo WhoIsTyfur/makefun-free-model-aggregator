@@ -6,10 +6,10 @@ export interface Provider { id: string; name: string; wire: string; auth: string
 export interface Rating { model: string; provider: string; rating_milli: number; context_length: number | null; tools: boolean; vision: boolean; json: boolean }
 export interface Requires { tools?: boolean; vision?: boolean; json?: boolean; min_context?: number }
 export interface Row { id: string; api: string; stream: boolean; weight: number; requires: Requires }
-export interface Brief { providers: Provider[]; ratings: Rating[]; manifest: Row[] }
+export interface Brief { providers: Provider[]; ratings: Rating[]; manifest: Row[]; best: Map<string, number> }
 
 export function readBrief(file: string): Brief {
-  const brief: Brief = { providers: [], ratings: [], manifest: [] };
+  const brief: Brief = { providers: [], ratings: [], manifest: [], best: new Map() };
   if (file === '') return brief;
   let text = '';
   try { text = readFileSync(file, 'utf8'); } catch { return brief; }
@@ -21,6 +21,7 @@ export function readBrief(file: string): Brief {
     const schema = typeof doc.schema === 'string' ? doc.schema : '';
     if (schema.endsWith('/providers/v1') && Array.isArray(doc.providers)) brief.providers = doc.providers;
     if (schema.endsWith('/ratings/v1') && Array.isArray(doc.ratings)) brief.ratings = doc.ratings.filter((r: any) => r.free === true);
+    if (schema.endsWith('/ratings/v1') && Array.isArray(doc.best)) for (const b of doc.best) if (typeof b.id === 'string' && typeof b.rating_milli === 'number') brief.best.set(b.id, b.rating_milli);
     if (schema.endsWith('/workload/v1') && Array.isArray(doc.manifest)) brief.manifest = doc.manifest;
   }
   return brief;

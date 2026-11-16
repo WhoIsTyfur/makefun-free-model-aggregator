@@ -4,9 +4,11 @@
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readBrief, modelsFromListing, modelsFromRatings, catalogText, freeIds, candidates } from './lib/brief.ts';
-import type { CatalogEntry, Requires } from './lib/brief.ts';
+import type { CatalogEntry, Rating, Requires } from './lib/brief.ts';
 import { neutralOf, providerBody, answerOf, clientAnswer, clientError } from './lib/wire.ts';
 import { listModels, infer } from './lib/upstream.ts';
+import { Risk, lossCap, plan } from './lib/plan.ts';
+import type { Need } from './lib/plan.ts';
 
 const ENV = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const brief = readBrief(process.env.MAKEFUN_PROMPT_FILE ?? '');
@@ -24,6 +26,37 @@ async function buildCatalog(): Promise<CatalogEntry[]> {
 
 const dead = new Set<string>();
 let served = 0;
+const risk = new Risk();
+const LAMBDA = Number(process.env.AGG_LAMBDA ?? '0.0003');
+let lossSoFar = 0;
+const bound = brief.manifest.reduce((s, m) => s + (m.weight ?? 1) * (brief.best.get(m.id) ?? 0), 0);
+const cap = lossCap(bound);
+
+const PLAN = (process.env.AGG_PLAN ?? '1') === '1';
+
+// The remaining workload planned as one assignment; the current request's provider, or null.
+function planned_for(id: string | null, list: Rating[], weight: number, top: number, tried: Set<string>): string | null {
+  const at = id === null ? -1 : brief.manifest.findIndex((m) => m.id === id);
+  if (at < 0) return null;
+  const needs: Need[] = [{ options: new Map(list.map((r) => [r.provider, weight * Math.max(0, top - r.rating_milli)])) }];
+  for (const m of brief.manifest.slice(at + 1)) {
+    const mBest = brief.best.get(m.id);
+    const opts = candidates(brief, m.requires ?? {}, m.api, m.api === 'openai' && m.requires?.json === true, freeSet)
+      .filter((r) => !dead.has(r.provider) && providers.has(r.provider));
+    if (opts.length === 0) continue;
+    const t = mBest ?? opts[0].rating_milli;
+    needs.push({ options: new Map(opts.map((r) => [r.provider, (m.weight ?? 1) * Math.max(0, t - r.rating_milli)])) });
+  }
+  const risks = new Map<string, number[]>();
+  for (const p of brief.providers) if (!dead.has(p.id)) risks.set(p.id, risk.slotRisks(p.id, Math.min(needs.length, 12)));
+  for (let lambda = LAMBDA, round = 0; round < 6; round++, lambda *= 3) {
+    const assign = plan(needs, risks, lambda);
+    let loss = lossSoFar;
+    needs.forEach((nd, i) => { const p = assign[i]; loss += p === null ? 0 : nd.options.get(p) ?? 0; });
+    if (loss <= cap || round === 5) return assign[0] !== null && !tried.has(assign[0]) ? assign[0] : null;
+  }
+  return null;
+}
 
 async function envJson(path: string, init?: RequestInit): Promise<any> {
   const res = await fetch(`${ENV}${path}`, init);
@@ -42,22 +75,38 @@ async function serve(api: string, body: any, version: string): Promise<{ status:
   try { const w = await envJson('/work'); if (w && w.done === false && typeof w.next === 'string') id = w.next; } catch { id = null; }
   const n = neutralOf(api, body);
   const stream = body.stream === true;
-  const list = candidates(brief, requiresFor(id, n), api, n.json, freeSet);
-  for (const r of list) {
-    const p = providers.get(r.provider);
-    if (p === undefined || dead.has(p.id)) continue;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const out = await infer(ENV, p, r.model, providerBody(p.wire, api, body, n, r.model), version);
-      if (out.kind === 'ok') {
-        const a = answerOf(p.wire, out.body);
-        if (a === null) break;
-        served += 1;
-        const reply = clientAnswer(api, stream, a, r.model, served);
-        return { status: 200, ...reply };
-      }
-      if (out.kind === 'dead') dead.add(p.id);
-      if (out.kind !== 'refused') break;
+  const row = id === null ? undefined : brief.manifest.find((m) => m.id === id);
+  const weight = row?.weight ?? 1;
+  const best = (id !== null ? brief.best.get(id) : undefined) ?? null;
+  const tried = new Set<string>();
+  for (;;) {
+    // Rank the providers still standing: refusal risk plus the rating this request would lose.
+    const list = candidates(brief, requiresFor(id, n), api, n.json, freeSet)
+      .filter((r) => !dead.has(r.provider) && !tried.has(r.provider) && providers.has(r.provider));
+    if (list.length === 0) break;
+    const top = best ?? list[0].rating_milli;
+    const scored = list.map((r, i) => {
+      const lose = weight * Math.max(0, top - r.rating_milli);
+      const over = best !== null && lossSoFar + lose > cap;
+      return { r, i, lose, cost: (over ? 1000 : 0) + risk.pFail(r.provider) + LAMBDA * lose };
+    });
+    scored.sort((a, b) => a.cost - b.cost || a.i - b.i);
+    let pick = scored[0];
+    const planned = PLAN ? planned_for(id, list, weight, top, tried) : null;
+    if (planned !== null) pick = scored.find((s) => s.r.provider === planned) ?? pick;
+    const p = providers.get(pick.r.provider)!;
+    const out = await infer(ENV, p, pick.r.model, providerBody(p.wire, api, body, n, pick.r.model), version);
+    if (out.kind === 'ok') {
+      risk.record(p.id, 'ok');
+      const a = answerOf(p.wire, out.body);
+      if (a === null) { tried.add(p.id); continue; }
+      lossSoFar += pick.lose;
+      served += 1;
+      return { status: 200, ...clientAnswer(api, stream, a, pick.r.model, served) };
     }
+    if (out.kind === 'dead') { dead.add(p.id); if (out.outage) risk.outageSeen = true; }
+    else if (out.kind === 'refused') risk.record(p.id, 'sched');
+    tried.add(p.id);
   }
   return { status: 503, type: 'application/json', body: clientError(api, 503, 'no free model could answer this request') };
 }

@@ -14,9 +14,12 @@ free model that meets its requirements, across ten free-tier providers on the Op
   registers every provider with its base path, key variable, wire and each model's free flag. `--list` prints
   the same document byte for byte. Its own `GET /v1/models` lists exactly the free model ids, in the OpenAI
   shape for `Authorization: Bearer` and the Anthropic shape for `x-api-key`.
-- **Routing** (`lib/brief.ts`): for each request it looks up the requirements in the workload manifest
-  (tools, images, JSON mode, minimum context), ranks the legal free models by their quality rating and calls
-  the best provider that still has budget.
+- **Routing** (`lib/brief.ts`, `lib/plan.ts`): for each request it looks up the requirements in the workload
+  manifest (tools, images, JSON mode, minimum context) and the legal free models. A small Bayesian model of
+  each provider's hidden free tier (budget, scheduled refusals, outage), conditioned on every answer seen,
+  gives each future call's refusal risk; a min-cost assignment of the remaining requests to provider call
+  slots trades that risk against the rating lost, inside the quality column's rounding slack. Few refusals
+  means few provider calls, the tie-break.
 - **Failover** (`lib/upstream.ts`): a refusal saying the budget is spent or the provider is out marks that
   provider dead for the trial; a scheduled refusal moves on, and the request goes to the next best model.
 - **Wire translation** (`lib/wire.ts`): same-wire requests are forwarded untouched; cross-wire requests are
@@ -30,8 +33,8 @@ Each trial scores 0 to 100: quality 60% (the served model's rating over the best
 requests weighted double), served 15%, wire checks 10%, failover 10% and catalog 5%. Ties go to fewer
 provider calls.
 
-Local result on the three practice trials: score 99 on each (quality 99, served 100, wire 100,
-failover 100, catalog 100).
+Local result on the three practice trials and eight freshly drawn instances: score 99 on every one
+(served, wire, failover and catalog 100), averaging about 21 provider calls for the 20 requests.
 
 ## Run it locally
 With the bounty's kit unpacked in `kit/`:

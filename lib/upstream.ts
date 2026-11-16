@@ -28,7 +28,7 @@ export async function listModels(envUrl: string, p: Provider): Promise<any | nul
 
 export type Outcome =
   | { kind: 'ok'; body: any }
-  | { kind: 'dead' }        // budget spent or outage: the provider serves no more this trial
+  | { kind: 'dead'; outage: boolean } // budget spent or outage: the provider serves no more this trial
   | { kind: 'refused' }     // a refusal on the provider's schedule: a later call may pass
   | { kind: 'busy' }        // concurrent_requests
   | { kind: 'bad' };        // 400/401/other: this model or call cannot serve
@@ -50,10 +50,13 @@ export async function infer(envUrl: string, p: Provider, model: string, body: an
   if (res.status >= 200 && res.status < 300) {
     try { return { kind: 'ok', body: JSON.parse(text) }; } catch { return { kind: 'bad' }; }
   }
-  if (res.status === 402) return { kind: 'dead' };
+  if (res.status === 402) {
+    if (/refused this call/.test(text)) return { kind: 'refused' };
+    return { kind: 'dead', outage: /is out/.test(text) };
+  }
   if (res.status === 429 || res.status >= 500) {
     if (text.includes('concurrent_requests')) return { kind: 'busy' };
-    if (/budget is spent|is out\b/.test(text)) return { kind: 'dead' };
+    if (/budget is spent|is out\b/.test(text)) return { kind: 'dead', outage: /is out/.test(text) };
     return { kind: 'refused' };
   }
   return { kind: 'bad' };
